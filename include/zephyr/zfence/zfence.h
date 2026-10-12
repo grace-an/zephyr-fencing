@@ -42,11 +42,12 @@ extern "C" {
  * earlier values. Use separate fences when operations must complete
  * independently or out of order.
  *
- * The fence retains the result for only its latest completed value. A query
- * for a future value returns ZFENCE_RESULT_UNSIGNALED. A query for an earlier
- * completed value returns ZFENCE_RESULT_OVERWRITTEN because its individual
- * result is no longer retained. Applications may use their own result values
- * except for these reserved values.
+ * The fence retains the result and cycle timestamp for only its latest
+ * completed value. A query for a future value returns
+ * ZFENCE_RESULT_UNSIGNALED. A query for an earlier completed value returns
+ * ZFENCE_RESULT_OVERWRITTEN because its individual metadata is no longer
+ * retained. Applications may use their own result values except for these
+ * reserved values.
  *
  * Synchronous waiters use caller-owned zfence_wait_context_t objects. A
  * context must remain valid while a wait is in progress and be released with
@@ -80,10 +81,12 @@ extern "C" {
  */
 struct zfence {
 	/** @cond INTERNAL_HIDDEN */
+	struct k_spinlock state_lock;
 	struct k_event event;
 	atomic_t signal_seq;
 	atomic_t reserved_seq;
 	atomic_t result;
+	uint64_t timestamp;
 #ifdef CONFIG_ZFENCE_PER_FENCE_WAIT_CTX
 	atomic_t waiter_bits_used;
 #endif
@@ -121,6 +124,7 @@ typedef struct zfence_wait_context zfence_wait_context_t;
 		.signal_seq = ATOMIC_INIT(0),                                    \
 		.reserved_seq = ATOMIC_INIT(0),                                  \
 		.result = ATOMIC_INIT(ZFENCE_RESULT_UNSIGNALED),                 \
+		.timestamp = 0U,                                                 \
 	}
 #else
 #define ZFENCE_DEFINE(_name)                                                \
@@ -129,6 +133,7 @@ typedef struct zfence_wait_context zfence_wait_context_t;
 		.signal_seq = ATOMIC_INIT(0),                                    \
 		.reserved_seq = ATOMIC_INIT(0),                                  \
 		.result = ATOMIC_INIT(ZFENCE_RESULT_UNSIGNALED),                 \
+		.timestamp = 0U,                                                 \
 		.waiter_bits_used = ATOMIC_INIT(0),                              \
 	}
 #endif
@@ -168,8 +173,8 @@ uint64_t zfence_current(struct zfence *fence);
  *
  * @details Signal the next unsignaled sequence value with the given result
  *          code. This is guaranteed to increment the latest signaled
- *          sequence value by one. This wakes up synchronous waiters
- *          and propagates result code.
+ *          sequence value by one. This captures the current hardware cycle
+ *          count, wakes up synchronous waiters, and propagates result code.
  *
  * @param fence   Fence instance
  * @param result  Result code; must not be ZFENCE_RESULT_UNSIGNALED or
@@ -188,8 +193,8 @@ int zfence_signal(struct zfence *fence, int result);
  *          the return value from zfence_next().
  *          This may be used to signal a later sequence value, which will
  *          signal both this sequence value and any unsignaled intermediate
- *          sequence values. This wakes up synchronous waiters
- *          and propagates result code.
+ *          sequence values. This captures the current hardware cycle count,
+ *          wakes up synchronous waiters, and propagates result code.
  *
  * @param fence   Fence instance
  * @param seq     Sequence value to signal
@@ -214,6 +219,26 @@ int zfence_signal_seq(struct zfence *fence, uint64_t seq, int result);
  * @return >=0 or negative error from signal otherwise
  */
 int zfence_result(struct zfence *fence, uint64_t seq);
+
+/**
+ * @brief Get the timestamp for the latest completed sequence value.
+ *
+ * @details Returns the hardware cycle count captured when @p seq was
+ *          signaled. On platforms with a 64-bit cycle counter, the full
+ *          counter value is returned. Otherwise, the 32-bit cycle counter is
+ *          returned in a uint64_t and wraps at 32 bits. The timestamp is
+ *          retained only for the latest completed sequence value.
+ *
+ * @param fence Fence instance
+ * @param seq Sequence value to query
+ * @param timestamp Pointer to receive the captured cycle count
+ *
+ * @retval 0 Success
+ * @retval -EAGAIN The sequence value is not signaled
+ * @retval -ENODATA A newer sequence value has overwritten the timestamp
+ * @retval -EINVAL Invalid argument
+ */
+int zfence_timestamp(struct zfence *fence, uint64_t seq, uint64_t *timestamp);
 
 /**
  * @brief Initialize a wait context for use with zfence_wait().

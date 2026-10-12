@@ -51,13 +51,20 @@ that must complete independently or out of order.
 Results
 *******
 
-The fence retains the result associated with only its latest completed sequence
-value. :c:func:`zfence_result` reports
+The fence retains the result and cycle timestamp associated with only its
+latest completed sequence value. :c:func:`zfence_result` reports
 :c:macro:`ZFENCE_RESULT_UNSIGNALED` for a future value,
 :c:macro:`ZFENCE_RESULT_OVERWRITTEN` for an earlier completed value whose
 result is no longer retained, or the stored result for the current value.
 Applications can use their own result values except for the two reserved
 sentinels.
+
+:c:func:`zfence_timestamp` returns the hardware cycle count captured when the
+latest value was signaled. On targets without a 64-bit cycle counter, the
+32-bit cycle count is returned in a 64-bit value and wraps at 32 bits. A
+timestamp query for a future value returns ``-EAGAIN``; one for an earlier
+completed value returns ``-ENODATA`` because its timestamp is no longer
+retained.
 
 Waiting
 *******

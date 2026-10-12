@@ -5,6 +5,8 @@
 
 #include <zephyr/zfence/zfence.h>
 
+#include <string.h>
+
 /*
  * Bitmask passed to k_event_post() to signal on all event bits.
  * k_event uses a uint32_t bitmask, so setting all 32 bits
@@ -194,9 +196,11 @@ void zfence_init(struct zfence *fence)
 
 	k_event_init(&fence->event);
 
+	memset(&fence->state_lock, 0, sizeof(fence->state_lock));
 	atomic_set(&fence->signal_seq, 0);
 	atomic_set(&fence->reserved_seq, 0);
 	atomic_set(&fence->result, ZFENCE_RESULT_UNSIGNALED);
+	fence->timestamp = 0U;
 
 	zfence_pool_init(fence);
 }
@@ -253,16 +257,25 @@ static inline bool zfence_is_invalid_result(int result)
 	return result == ZFENCE_RESULT_UNSIGNALED || result == ZFENCE_RESULT_OVERWRITTEN;
 }
 
+static uint64_t zfence_cycle_get(void)
+{
+	if (IS_ENABLED(CONFIG_TIMER_HAS_64BIT_CYCLE_COUNTER)) {
+		return k_cycle_get_64();
+	}
+
+	return (uint64_t)k_cycle_get_32();
+}
+
 /*
  * Signal the next unsignaled sequence value with a result code.
  *
- * Uses a CAS loop to atomically increment signal_seq without a spinlock.
- * result is stored after the CAS succeeds so that it is visible to readers
- * that observe the new sequence value.
+ * Serializes completion metadata so the latest sequence, result, and timestamp
+ * remain coherent for readers on all architectures.
  */
 int zfence_signal(struct zfence *fence, int result)
 {
 	atomic_val_t old_val;
+	k_spinlock_key_t key;
 
 	if (fence == NULL) {
 		return -EINVAL;
@@ -272,24 +285,20 @@ int zfence_signal(struct zfence *fence, int result)
 		return -EINVAL;
 	}
 
-	do {
-		old_val = atomic_get(&fence->signal_seq);
+	key = k_spin_lock(&fence->state_lock);
+	old_val = atomic_get(&fence->signal_seq);
 #if !defined(CONFIG_64BIT)
-		/* On 32-bit platforms refuse to wrap past UINT32_MAX. */
-		if ((unsigned long)old_val >= ZFENCE_SEQ_MAX) {
-			return -EINVAL;
-		}
+	/* On 32-bit platforms refuse to wrap past UINT32_MAX. */
+	if ((unsigned long)old_val >= ZFENCE_SEQ_MAX) {
+		k_spin_unlock(&fence->state_lock, key);
+		return -EINVAL;
+	}
 #endif
-	} while (!atomic_cas(&fence->signal_seq, old_val, old_val + 1));
 
-	/*
-	 * Store result after the CAS so that once the new signal_seq is
-	 * visible to readers, the associated result is already in place.
-	 * There is a brief window where signal_seq has advanced but result
-	 * still holds the previous value; this is acceptable for a lock-free
-	 * design.
-	 */
 	atomic_set(&fence->result, result);
+	fence->timestamp = zfence_cycle_get();
+	atomic_set(&fence->signal_seq, old_val + 1);
+	k_spin_unlock(&fence->state_lock, key);
 
 	k_event_post(&fence->event, ZFENCE_EVENT_MASK);
 	return 0;
@@ -298,15 +307,15 @@ int zfence_signal(struct zfence *fence, int result)
 /*
  * Signal a specific sequence value with a result code.
  *
- * Uses a CAS loop to advance signal_seq to the requested value without a
- * spinlock.  Returns -EALREADY if the fence has already been signaled at or
- * beyond seq.  On 32-bit platforms, seq values exceeding UINT32_MAX are
- * rejected with -EINVAL.
+ * Returns -EALREADY if the fence has already been signaled at or beyond seq.
+ * On 32-bit platforms, seq values exceeding UINT32_MAX are rejected with
+ * -EINVAL.
  */
 int zfence_signal_seq(struct zfence *fence, uint64_t seq, int result)
 {
 	atomic_val_t cur_val;
 	atomic_val_t new_val;
+	k_spinlock_key_t key;
 
 	if (fence == NULL) {
 		return -EINVAL;
@@ -325,25 +334,17 @@ int zfence_signal_seq(struct zfence *fence, uint64_t seq, int result)
 
 	new_val = (atomic_val_t)(unsigned long)seq;
 
-	/*
-	 * CAS loop: advance signal_seq to new_val only if the current value is
-	 * strictly less than new_val.  No spinlock required.
-	 */
-	do {
-		cur_val = atomic_get(&fence->signal_seq);
-		if ((unsigned long)cur_val >= (unsigned long)new_val) {
-			return -EALREADY;
-		}
-	} while (!atomic_cas(&fence->signal_seq, cur_val, new_val));
+	key = k_spin_lock(&fence->state_lock);
+	cur_val = atomic_get(&fence->signal_seq);
+	if ((unsigned long)cur_val >= (unsigned long)new_val) {
+		k_spin_unlock(&fence->state_lock, key);
+		return -EALREADY;
+	}
 
-	/*
-	 * Store result after the CAS so that once the new signal_seq is
-	 * visible to readers, the associated result is already in place.
-	 * There is a brief window where signal_seq has advanced but result
-	 * still holds the previous value; this is acceptable for a lock-free
-	 * design.
-	 */
 	atomic_set(&fence->result, result);
+	fence->timestamp = zfence_cycle_get();
+	atomic_set(&fence->signal_seq, new_val);
+	k_spin_unlock(&fence->state_lock, key);
 
 	k_event_post(&fence->event, ZFENCE_EVENT_MASK);
 	return 0;
@@ -353,21 +354,51 @@ int zfence_result(struct zfence *fence, uint64_t seq)
 {
 	uint64_t cur_seq;
 	int cur_res;
+	k_spinlock_key_t key;
 
 	if (fence == NULL) {
 		return -EINVAL;
 	}
 
+	key = k_spin_lock(&fence->state_lock);
 	cur_seq = (uint64_t)(unsigned long)atomic_get(&fence->signal_seq);
 	if (seq > cur_seq) {
-		return ZFENCE_RESULT_UNSIGNALED;
+		cur_res = ZFENCE_RESULT_UNSIGNALED;
+	} else if (seq < cur_seq) {
+		cur_res = ZFENCE_RESULT_OVERWRITTEN;
+	} else {
+		cur_res = (int)atomic_get(&fence->result);
 	}
-	if (seq < cur_seq) {
-		return ZFENCE_RESULT_OVERWRITTEN;
+	k_spin_unlock(&fence->state_lock, key);
+
+	return cur_res;
+}
+
+int zfence_timestamp(struct zfence *fence, uint64_t seq, uint64_t *timestamp)
+{
+	uint64_t cur_seq;
+	int cur_res;
+	k_spinlock_key_t key;
+
+	if ((fence == NULL) || (timestamp == NULL)) {
+		return -EINVAL;
 	}
 
+	key = k_spin_lock(&fence->state_lock);
+	cur_seq = (uint64_t)(unsigned long)atomic_get(&fence->signal_seq);
 	cur_res = (int)atomic_get(&fence->result);
-	return cur_res;
+	if ((seq > cur_seq) || (cur_res == ZFENCE_RESULT_UNSIGNALED)) {
+		k_spin_unlock(&fence->state_lock, key);
+		return -EAGAIN;
+	}
+	if (seq < cur_seq) {
+		k_spin_unlock(&fence->state_lock, key);
+		return -ENODATA;
+	}
+
+	*timestamp = fence->timestamp;
+	k_spin_unlock(&fence->state_lock, key);
+	return 0;
 }
 
 int zfence_wait_ctx_init(zfence_wait_context_t *ctx, struct zfence *fence)

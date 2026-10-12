@@ -479,7 +479,71 @@ ZTEST(zfence_suite, test_result_custom_error_code)
 		"zfence_result must return the custom error code -EIO");
 }
 
-/* Test 6: zfence_current */
+/* Test 6: zfence_timestamp - latest completion timestamp query */
+
+ZTEST(zfence_suite, test_timestamp_unsignaled)
+{
+	uint64_t timestamp = UINT64_MAX;
+
+	zassert_equal(zfence_timestamp(&g_fence, 0, &timestamp), -EAGAIN,
+		"initial sequence must not have a timestamp");
+	zassert_equal(zfence_timestamp(&g_fence, 1, &timestamp), -EAGAIN,
+		"future sequence must not have a timestamp");
+	zassert_equal(timestamp, UINT64_MAX, "failed query must not write timestamp");
+}
+
+ZTEST(zfence_suite, test_timestamp_current)
+{
+	uint64_t timestamp = UINT64_MAX;
+
+	g_fence.timestamp = UINT64_MAX;
+	zassert_equal(zfence_signal(&g_fence, ZFENCE_RESULT_OK), 0,
+		"signal must succeed");
+	zassert_equal(zfence_timestamp(&g_fence, 1, &timestamp), 0,
+		"latest sequence must have a timestamp");
+	zassert_not_equal(timestamp, UINT64_MAX,
+		"signal must replace the previous timestamp");
+	zassert_equal(timestamp, g_fence.timestamp,
+		"query must return the stored timestamp");
+}
+
+ZTEST(zfence_suite, test_timestamp_overwritten)
+{
+	uint64_t timestamp = UINT64_MAX;
+
+	zassert_equal(zfence_signal(&g_fence, ZFENCE_RESULT_OK), 0,
+		"first signal must succeed");
+	zassert_equal(zfence_signal(&g_fence, ZFENCE_RESULT_OK), 0,
+		"second signal must succeed");
+	zassert_equal(zfence_timestamp(&g_fence, 1, &timestamp), -ENODATA,
+		"older sequence timestamp must be overwritten");
+	zassert_equal(zfence_timestamp(&g_fence, 2, &timestamp), 0,
+		"latest sequence must retain its timestamp");
+}
+
+ZTEST(zfence_suite, test_timestamp_signal_seq)
+{
+	uint64_t timestamp = UINT64_MAX;
+
+	zassert_equal(zfence_signal_seq(&g_fence, 3, ZFENCE_RESULT_OK), 0,
+		"jump-ahead signal must succeed");
+	zassert_equal(zfence_timestamp(&g_fence, 2, &timestamp), -ENODATA,
+		"intermediate sequence timestamp must not be retained");
+	zassert_equal(zfence_timestamp(&g_fence, 3, &timestamp), 0,
+		"explicitly signaled sequence must have a timestamp");
+}
+
+ZTEST(zfence_suite, test_timestamp_invalid_arguments)
+{
+	uint64_t timestamp;
+
+	zassert_equal(zfence_timestamp(NULL, 1, &timestamp), -EINVAL,
+		"NULL fence must return -EINVAL");
+	zassert_equal(zfence_timestamp(&g_fence, 1, NULL), -EINVAL,
+		"NULL timestamp must return -EINVAL");
+}
+
+/* Test 7: zfence_current */
 
 ZTEST(zfence_suite, test_current_initial)
 {
